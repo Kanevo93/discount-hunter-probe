@@ -148,6 +148,79 @@ def _parse_bhx(html: str) -> dict:
     return extra
 
 
+BHX_API_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": BASE_HEADERS["Accept-Language"],
+    "Content-Type": "application/json",
+    "Origin": "https://www.bachhoaxanh.com",
+    "Referer": "https://www.bachhoaxanh.com/",
+    "referer-url": "https://www.bachhoaxanh.com/tim-kiem",
+    "platform": "webnew",
+    "reversehost": "http://bhxapi.live",
+    "xapikey": "bhx-api-core-2022",
+    "customer-id": "",
+    "deviceid": "7482b0a0-8e85-4c9a-8345-b825d2800fe0",
+}
+
+
+def probe_bhx_api(client: httpx.Client) -> dict:
+    """API JSON nội bộ của BHX (api.bachhoaxanh.com) — domain riêng, có thể không chịu geo rule của web."""
+    url = "https://api.bachhoaxanh.com/gw/search/v2/DataSearch"
+    body = {"keywords": "sua tuoi", "provinceId": 1027, "storeId": 2546,
+            "pageIndex": 0, "pageSize": 5, "brandIds": "", "categoryIds": "", "sortStr": ""}
+    attempts = []
+    # 1) httpx
+    try:
+        t0 = time.perf_counter()
+        r = client.post(url, headers=BHX_API_HEADERS, json=body)
+        res = _result("BHX API", url, r.status_code, r.text, time.perf_counter() - t0, attempt="httpx")
+        try:
+            d = r.json()["data"]
+            prods = d.get("products", [])
+            res["count"] = len(prods)
+            res["total"] = d.get("total")
+            if prods:
+                p = prods[0]
+                pp = (p.get("productPrices") or [{}])[0]
+                res["first"] = {"name": p.get("name"), "productCode": p.get("productCode"),
+                                "unit": p.get("unit"), "price": pp.get("price"),
+                                "sysPrice": pp.get("sysPrice"), "discountPercent": pp.get("discountPercent"),
+                                "stock": pp.get("quantity"), "promotionText": p.get("promotionText")}
+                return res
+        except Exception as e:  # noqa: BLE001
+            res["parse_error"] = repr(e)
+        attempts.append(res)
+    except Exception as e:  # noqa: BLE001
+        attempts.append({"attempt": "httpx", "verdict": "ERROR", "error": repr(e)})
+    # 2) curl_cffi
+    try:
+        from curl_cffi import requests as cffi_requests
+        t0 = time.perf_counter()
+        r2 = cffi_requests.post(url, impersonate="chrome", timeout=TIMEOUT,
+                                headers={k: v for k, v in BHX_API_HEADERS.items() if k != "User-Agent"},
+                                json=body)
+        res2 = _result("BHX API", url, r2.status_code, r2.text, time.perf_counter() - t0,
+                       attempt="curl_cffi(chrome)")
+        try:
+            d = r2.json()["data"]
+            prods = d.get("products", [])
+            res2["count"] = len(prods)
+            if prods:
+                p = prods[0]
+                pp = (p.get("productPrices") or [{}])[0]
+                res2["first"] = {"name": p.get("name"), "productCode": p.get("productCode"),
+                                 "price": pp.get("price"), "sysPrice": pp.get("sysPrice"),
+                                 "promotionText": p.get("promotionText")}
+        except Exception as e:  # noqa: BLE001
+            res2["parse_error"] = repr(e)
+        res2["previous_attempts"] = attempts
+        return res2
+    except Exception as e:  # noqa: BLE001
+        return {"site": "BHX API", "url": url, "verdict": "ERROR", "error": repr(e),
+                "previous_attempts": attempts}
+
+
 def probe_bhx(client: httpx.Client) -> dict:
     """Lần 1: httpx thường. Lần 2: curl_cffi giả TLS fingerprint Chrome
     (phân biệt chặn theo fingerprint vs chặn theo địa lý)."""
@@ -204,7 +277,7 @@ def run_all() -> dict:
         return {
             "origin": probe_ip(client),
             "keyword": KEYWORD,
-            "results": [probe_lotte(client), probe_go(client), probe_bhx(client)],
+            "results": [probe_lotte(client), probe_go(client), probe_bhx(client), probe_bhx_api(client)],
         }
 
 
