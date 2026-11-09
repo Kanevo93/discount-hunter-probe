@@ -94,9 +94,15 @@ def probe_lotte(client: httpx.Client) -> dict:
 
 # ---------------------------------------------------------------- GO!
 def probe_go(client: httpx.Client) -> dict:
+    """GO! gắn session vào cookie (device_token / store). Nếu env GO_COOKIE có giá trị
+    (copy từ trình duyệt) thì gửi kèm để kiểm tra cookie-replay có được chấp nhận không."""
     home = "https://sieuthi-go.vn/"
+    go_cookie = os.environ.get("GO_COOKIE", "").strip()
     try:
-        r0, dt0 = _get(client, home, headers=BASE_HEADERS)
+        headers0 = dict(BASE_HEADERS)
+        if go_cookie:
+            headers0["Cookie"] = go_cookie
+        r0, dt0 = _get(client, home, headers=headers0)
         v0 = classify(r0.status_code, r0.text)
         m = re.search(r'"buildId":"([^"]+)"', r0.text)
         if v0 != "OK" or not m:
@@ -105,11 +111,17 @@ def probe_go(client: httpx.Client) -> dict:
         build_id = m.group(1)
         url = f"https://sieuthi-go.vn/_next/data/{build_id}/search.json?keyword={quote(KEYWORD)}"
         headers = {**BASE_HEADERS, "Accept": "*/*", "Referer": home, "x-nextjs-data": "1"}
+        if go_cookie:
+            headers["Cookie"] = go_cookie
         r, dt = _get(client, url, headers=headers)
-        extra = {"build_id": build_id, "home_ms": int(dt0 * 1000)}
+        extra = {"build_id": build_id, "home_ms": int(dt0 * 1000),
+                 "cookie_sent": bool(go_cookie)}
         try:
-            prods = r.json()["pageProps"]["productsSeach"]
+            pp = r.json()["pageProps"]
+            prods = pp["productsSeach"]
             extra["count"] = len(prods)
+            extra["store"] = {"storeID": pp.get("storeSeo", {}).get("storeID"),
+                              "name": pp.get("storeSeo", {}).get("name")}
             if prods:
                 p = prods[0]
                 extra["first"] = {
@@ -125,32 +137,66 @@ def probe_go(client: httpx.Client) -> dict:
 
 
 # ---------------------------------------------------------------- Bách Hóa Xanh
+def _parse_bhx(html: str) -> dict:
+    cards = html.count('class="box_product')
+    titles = re.findall(r'product-code="(\d+)">\s*<a[^>]*title="([^"]+)"', html)
+    prices = re.findall(r'(\d{1,3}(?:\.\d{3})+)đ', html)
+    extra = {"product_cards": cards}
+    if titles:
+        extra["first"] = {"product_code": titles[0][0], "name": titles[0][1],
+                          "first_price_seen": prices[0] if prices else None}
+    return extra
+
+
 def probe_bhx(client: httpx.Client) -> dict:
+    """Lần 1: httpx thường. Lần 2: curl_cffi giả TLS fingerprint Chrome
+    (phân biệt chặn theo fingerprint vs chặn theo địa lý)."""
     url = f"https://www.bachhoaxanh.com/tim-kiem?key={quote(KEYWORD)}"
+    out = {"site": "Bách Hóa Xanh", "url": url}
     try:
         r, dt = _get(client, url, headers=BASE_HEADERS)
-        html = r.text
-        cards = html.count('class="box_product')
-        titles = re.findall(r'product-code="(\d+)">\s*<a[^>]*title="([^"]+)"', html)
-        prices = re.findall(r'(\d{1,3}(?:\.\d{3})+)đ', html)
-        extra = {"product_cards": cards}
-        if titles:
-            extra["first"] = {"product_code": titles[0][0], "name": titles[0][1],
-                              "first_price_seen": prices[0] if prices else None}
-        return _result("Bách Hóa Xanh", url, r.status_code, html, dt, **extra)
+        out.update(_result("Bách Hóa Xanh", url, r.status_code, r.text, dt, **_parse_bhx(r.text)))
+        out["attempt"] = "httpx"
+        if out["verdict"] == "OK" and out.get("product_cards", 0) > 0:
+            return out
     except Exception as e:  # noqa: BLE001
-        return {"site": "Bách Hóa Xanh", "url": url, "verdict": "ERROR", "error": repr(e)}
+        out.update({"verdict": "ERROR", "error_httpx": repr(e)})
+
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        out["attempt2"] = "curl_cffi chưa cài (pip install curl_cffi)"
+        return out
+    try:
+        t0 = time.perf_counter()
+        r2 = cffi_requests.get(url, impersonate="chrome", timeout=TIMEOUT,
+                               headers={"Accept-Language": BASE_HEADERS["Accept-Language"]})
+        dt2 = time.perf_counter() - t0
+        res2 = _result("Bách Hóa Xanh", url, r2.status_code, r2.text, dt2, **_parse_bhx(r2.text))
+        res2["attempt"] = "curl_cffi(chrome)"
+        res2["httpx_result"] = {k: out.get(k) for k in ("verdict", "status", "error_httpx")}
+        return res2
+    except Exception as e:  # noqa: BLE001
+        out["attempt2"] = "curl_cffi(chrome)"
+        out["error_curl_cffi"] = repr(e)
+        out["verdict"] = "ERROR"
+        return out
 
 
 # ---------------------------------------------------------------- where am I
 def probe_ip(client: httpx.Client) -> dict:
-    try:
-        r = client.get("https://ipinfo.io/json", headers={"User-Agent": UA, "Accept": "application/json"})
-        j = r.json()
-        return {"ip": j.get("ip"), "country": j.get("country"), "region": j.get("region"),
-                "city": j.get("city"), "org": j.get("org")}
-    except Exception as e:  # noqa: BLE001
-        return {"error": repr(e)}
+    out = {}
+    for url in ("https://api.ipify.org?format=json", "https://ipapi.co/json/", "https://ipinfo.io/json"):
+        try:
+            r = client.get(url, headers={"User-Agent": UA, "Accept": "application/json"})
+            j = r.json()
+            out.setdefault("ip", j.get("ip"))
+            for k in ("country", "country_name", "region", "city", "org"):
+                if j.get(k):
+                    out.setdefault(k, j[k])
+        except Exception as e:  # noqa: BLE001
+            out.setdefault("errors", []).append(f"{url}: {e!r}")
+    return out
 
 
 def run_all() -> dict:
@@ -165,7 +211,8 @@ def run_all() -> dict:
 def to_markdown(out: dict) -> str:
     o = out["origin"]
     lines = [
-        f"**Chạy từ:** `{o.get('ip')}` — {o.get('city')}, {o.get('region')}, {o.get('country')} — {o.get('org')}",
+        f"**Chạy từ:** `{o.get('ip')}` — {o.get('city')}, {o.get('region')}, "
+        f"{o.get('country_name') or o.get('country')} — {o.get('org')}",
         "",
         "| Site | Verdict | HTTP | ms | Dữ liệu đọc được |",
         "|---|---|---|---|---|",
@@ -179,8 +226,15 @@ def to_markdown(out: dict) -> str:
         elif "parse_error" in r:
             got = "parse_error: " + r["parse_error"]
         count = r.get("total_items", r.get("count", r.get("product_cards", "")))
+        note = ""
+        if r.get("attempt"):
+            note += f" via {r['attempt']}"
+        if r.get("store"):
+            note += f" store={r['store']}"
+        if "cookie_sent" in r:
+            note += f" cookie={'yes' if r['cookie_sent'] else 'no'}"
         lines.append(f"| {r['site']} | **{r.get('verdict')}** | {r.get('status','')} | {r.get('ms','')} | "
-                     f"n={count} {got} |")
+                     f"n={count}{note} {got} |")
     lines += ["", "Copy toàn bộ JSON bên dưới gửi lại để phân tích."]
     return "\n".join(lines)
 
